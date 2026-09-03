@@ -1,0 +1,45 @@
+Fix: raw JSON tool calls dropped when a stray closing ``` trails them.
+
+StreamingToolDetector.processNormalState() always preferred a code-fence
+match over a raw-JSON match, even when the fence match occurred LATER in
+the buffered text. When Lumo emits a raw (unfenced) tool call and appends
+a stray, unmatched closing ``` out of habit -- and both land in the same
+chunk -- the detector mistakes that trailing ``` for an opening fence and
+swallows the entire preceding JSON as inert text. The tool call is never
+attempted, so opencode gets a text response instead of a function call
+and the agent turn just stops.
+
+Fix: only take the fence branch when the fence match occurs at or before
+any raw-JSON start in the current buffer.
+
+--- a/src/api/tools/streaming-tool-detector.ts
++++ b/src/api/tools/streaming-tool-detector.ts
+@@ -90,9 +90,19 @@
+    * Process normal state - looking for start of JSON patterns.
+    */
+   private processNormalState(result: ProcessResult): void {
+-    // Look for code fence start
++    // Look for code fence start and raw JSON start; whichever occurs earlier
++    // in pendingText wins. A stray, unmatched closing ``` that trails a raw
++    // (unfenced) JSON tool call must not be treated as an opening fence and
++    // hijack JSON that started earlier in the buffer - see regression test
++    // for the exact failure mode this guards against.
+     const fenceMatch = this.pendingText.match(/```(?:json)?\s*\n?/);
+-    if (fenceMatch && fenceMatch.index !== undefined) {
++    const jsonMatch = this.pendingText.match(/(?:^|\n)\s*(\{[\n\s]*")/);
++
++    if (
++      fenceMatch &&
++      fenceMatch.index !== undefined &&
++      (!jsonMatch || jsonMatch.index === undefined || fenceMatch.index <= jsonMatch.index)
++    ) {
+
+       logger.debug(`Code block opener found: ${this.showSnippet(fenceMatch.index)}`);
+
+@@ -108,7 +118,6 @@
+
+     // Look for raw JSON start (but be careful - need context)
+     // Only match if it looks like start of a tool call object
+-    const jsonMatch = this.pendingText.match(/(?:^|\n)\s*(\{[\n\s]*")/);
+     if (jsonMatch && jsonMatch.index !== undefined) {
+       logger.debug(`Raw JSON opener found: ${this.showSnippet(jsonMatch.index)}`);
