@@ -1,7 +1,8 @@
-Fix: valid tool calls dropped instead of salvaged at parse time.
+Fix: valid tool calls dropped, or leak stray text, instead of being
+recovered at parse time.
 
-Confirmed live in ~/.local/state/lumo-tamer/openroam-server.log across two
-distinct failure shapes, both ending with a well-formed tool call thrown away:
+Confirmed live in ~/.local/state/lumo-tamer/openroam-server.log across
+three distinct failure shapes:
 
 1. Trailing garbage glued onto an otherwise-complete object. Whenever Lumo
    emits two tool calls back-to-back in one turn, the FIRST one repeatedly
@@ -30,7 +31,27 @@ distinct failure shapes, both ending with a well-formed tool call thrown away:
    that actually creates the note, so this alone was enough to make the
    capture agent produce nothing on every run that reached it.
 
-Fix, in two parts:
+3. A stray "json" word (sometimes followed by real narration text) leaking
+   into the visible response even though both surrounding tool calls
+   succeed. Confirmed live via debug trace, back-to-back calls with no
+   closing fence between them:
+
+     Code block opener found: ```json
+     Code block ending found: `\n\n```json    <- swallows the NEXT call's
+                                                  own opener as if it were
+                                                  THIS call's closer
+     Raw JSON opener found: json\n{"name       <- "json" stranded at the
+                                                  front, emitted as text
+
+   processCodeFenceState()'s closing-fence search treats any three
+   backticks as a valid closer, including ones that are actually the start
+   of the next block's own ```json opener. completeCodeFence() already has
+   a workaround for this exact root cause on the buffer side
+   (`buffer.replace(/^json/, '')`), but processNormalState()'s raw-JSON
+   transition -- the path this case actually takes -- had no equivalent,
+   so the stranded "json" got emitted as literal text instead of discarded.
+
+Fix, in three parts:
 - When JSON.parse() fails, scan for the first complete, balanced {...}
   object at the start of the content and retry on just that substring
   before giving up. This discards trailing noise (a stray fence remnant,
@@ -40,10 +61,31 @@ Fix, in two parts:
 - finalize()'s end-of-stream salvage now retries a dangling in_code_fence
   buffer the same way it already does for in_raw_json, so a fence that
   never closes no longer forfeits an otherwise-valid tool call.
+- processNormalState()'s raw-JSON transition now strips a stray leading
+  "json" remnant from the text it emits, mirroring completeCodeFence()'s
+  existing workaround for the same root cause.
 
 --- a/src/api/tools/streaming-tool-detector.ts
 +++ b/src/api/tools/streaming-tool-detector.ts
-@@ -249,6 +249,50 @@
+@@ -123,9 +123,14 @@
+
+       const startIdx = jsonMatch.index + (jsonMatch[0].length - jsonMatch[1].length);
+
+-      // Emit text before the JSON
+-      if (startIdx > 0) {
+-        result.textToEmit += this.pendingText.slice(0, startIdx);
++      // Emit text before the JSON, minus a stray "json" fence-open remnant.
++      // Happens when the PREVIOUS block's closing-fence search swallowed this
++      // block's own "```" as if it were the previous block's closer, leaving
++      // just the "json" suffix stranded here (see completeCodeFence's
++      // matching workaround for the same root cause on the buffer side).
++      const prefix = this.pendingText.slice(0, startIdx).replace(/^\s*json\s*/, '');
++      if (prefix) {
++        result.textToEmit += prefix;
+       }
+       this.pendingText = this.pendingText.slice(startIdx);
+       this.state = 'in_raw_json';
+@@ -249,6 +254,50 @@
    }
 
    /**
@@ -94,7 +136,7 @@ Fix, in two parts:
     * Try to parse content as a tool call JSON.
     * Strips the configured prefix from the tool name.
     * Only logs/tracks as invalid if content appears to be an attempted tool call (has a name).
-@@ -275,6 +319,14 @@
+@@ -275,6 +324,14 @@
        }
        // Otherwise it's just regular JSON, don't track
      } catch {
@@ -109,7 +151,7 @@ Fix, in two parts:
        // JSON parse failed - only track if regex finds a name (looks like attempted tool call)
        const toolName = this.extractToolName(content);
        if (toolName) {
-@@ -307,7 +359,10 @@
+@@ -307,7 +364,10 @@
        if (trackerBuffer) {
          // End-of-stream fallback: try JSON.parse on the complete buffer.
          // Catches edge cases where char-by-char tracking failed but JSON is actually complete.
