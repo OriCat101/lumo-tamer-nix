@@ -1,0 +1,123 @@
+Fix: valid tool calls dropped instead of salvaged at parse time.
+
+Confirmed live in ~/.local/state/lumo-tamer/openroam-server.log across two
+distinct failure shapes, both ending with a well-formed tool call thrown away:
+
+1. Trailing garbage glued onto an otherwise-complete object. Whenever Lumo
+   emits two tool calls back-to-back in one turn, the FIRST one repeatedly
+   fails with "Invalid tool call (malformed JSON)" while later calls in the
+   same burst succeed:
+
+     Invalid tool call (malformed JSON): {"name": "user:org-roam_search_nodes",
+       "arguments": {"query": "openroam"}} ```
+
+   The logged content is a complete, valid JSON object immediately followed
+   by a stray "```" with nothing else after it -- consistent with a chunk
+   boundary splitting the three backtick characters of a fence marker (e.g.
+   2 land at the tail of one chunk, 1 at the head of the next) so neither
+   processCodeFenceState()'s in-chunk search nor its buffer-suffix check
+   recognizes the fence, and the remnant ends up glued onto the end of an
+   otherwise-complete buffered object. JSON.parse() then throws on the
+   trailing garbage and the whole call is discarded as inert text.
+
+2. A fence that never closes at all before the stream ends. Also confirmed
+   live: Lumo emitted ```json\n{"name": "user:org-roam_create_node", ...}
+   with no closing ``` before the stream terminated. finalize()'s end-of-
+   stream salvage already retries JSON.parse for a dangling in_raw_json
+   buffer, but does nothing for a dangling in_code_fence buffer -- it just
+   dumps the buffer as text, even when the JSON inside it is perfectly
+   valid. This is the one that mattered most in practice: it's the step
+   that actually creates the note, so this alone was enough to make the
+   capture agent produce nothing on every run that reached it.
+
+Fix, in two parts:
+- When JSON.parse() fails, scan for the first complete, balanced {...}
+  object at the start of the content and retry on just that substring
+  before giving up. This discards trailing noise (a stray fence remnant,
+  or the start of the next block) instead of failing the whole parse --
+  the next block still gets its own independent detection pass, as
+  already observed in the log for the calls that follow a corrupted one.
+- finalize()'s end-of-stream salvage now retries a dangling in_code_fence
+  buffer the same way it already does for in_raw_json, so a fence that
+  never closes no longer forfeits an otherwise-valid tool call.
+
+--- a/src/api/tools/streaming-tool-detector.ts
++++ b/src/api/tools/streaming-tool-detector.ts
+@@ -249,6 +249,50 @@
+   }
+
+   /**
++   * Scan for the first complete, balanced {...} object at the start of
++   * content, ignoring any trailing text after it. Recovers tool calls
++   * where a chunk-boundary race glues a stray fence marker (or the start
++   * of the next block) onto an otherwise-complete JSON object - see
++   * regression test for the exact failure mode this guards against.
++   */
++  private extractLeadingJsonObject(content: string): string | null {
++    const start = content.indexOf('{');
++    if (start === -1) return null;
++
++    let depth = 0;
++    let inString = false;
++    let escaped = false;
++
++    for (let i = start; i < content.length; i++) {
++      const char = content[i];
++
++      if (inString) {
++        if (escaped) {
++          escaped = false;
++        } else if (char === '\\') {
++          escaped = true;
++        } else if (char === '"') {
++          inString = false;
++        }
++        continue;
++      }
++
++      if (char === '"') {
++        inString = true;
++      } else if (char === '{') {
++        depth++;
++      } else if (char === '}') {
++        depth--;
++        if (depth === 0) {
++          return content.slice(start, i + 1);
++        }
++      }
++    }
++
++    return null;
++  }
++
++  /**
+    * Try to parse content as a tool call JSON.
+    * Strips the configured prefix from the tool name.
+    * Only logs/tracks as invalid if content appears to be an attempted tool call (has a name).
+@@ -275,6 +319,14 @@
+       }
+       // Otherwise it's just regular JSON, don't track
+     } catch {
++      // JSON parse failed - try recovering a complete object from a
++      // leading substring before giving up (e.g. trailing "```" glued on
++      // by a chunk-boundary race between two back-to-back tool calls).
++      const recovered = this.extractLeadingJsonObject(content);
++      if (recovered !== null && recovered !== content) {
++        const toolCall = this.tryParseToolCall(recovered);
++        if (toolCall) return toolCall;
++      }
+       // JSON parse failed - only track if regex finds a name (looks like attempted tool call)
+       const toolName = this.extractToolName(content);
+       if (toolName) {
+@@ -307,7 +359,10 @@
+       if (trackerBuffer) {
+         // End-of-stream fallback: try JSON.parse on the complete buffer.
+         // Catches edge cases where char-by-char tracking failed but JSON is actually complete.
+-        if (this.state === 'in_raw_json') {
++        // Also covers a fence that never closes at all (stream ends mid-block):
++        // without this, a perfectly valid tool call sitting in the buffer is
++        // dumped as text just because no closing ``` ever arrived.
++        if (this.state === 'in_raw_json' || this.state === 'in_code_fence') {
+           const toolCall = this.tryParseToolCall(trackerBuffer.trim());
+           if (toolCall) {
+             result.completedToolCalls.push(toolCall);

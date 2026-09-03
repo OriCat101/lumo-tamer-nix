@@ -93,7 +93,10 @@
             # opener, silently swallowing the whole tool call as inert text -- the agent
             # turn then just stops instead of executing the tool. See the patch file
             # for the full explanation.
-            patches = [ ./streaming-tool-detector-fence-priority.patch ];
+            patches = [
+              ./streaming-tool-detector-fence-priority.patch
+              ./streaming-tool-detector-salvage-recovery.patch
+            ];
 
             dontNpmBuild = true;
 
